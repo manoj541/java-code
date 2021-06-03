@@ -1,0 +1,342 @@
+launch:
+    parameters:
+        - app-tier-size:
+            description: Number of servers in app tier
+            default: 1
+            min: 1
+            max: 20
+        - app-fork: &app-fork
+            description: Source control fork
+            default: "qubell"
+        - app-branch: &app-branch
+            description: Source control branch
+            default: "HEAD"
+        - os: &os
+            description: Operation System
+            default: "us-east-1/ami-0fac7566"
+            enum:
+              "ubuntu-10.4": "us-east-1/ami-0fac7566"
+              "ubuntu-12.4": "us-east-1/ami-d0f89fb9"
+              "centos-5.3": "us-east-1/ami-beda31d7"
+              "centos-6.3": "us-east-1/ami-e585118c"
+        - identity: &identity
+            description: VM identity
+            default: "ubuntu"
+            enum:
+              "ubuntu": "ubuntu"
+              "centos": "root"
+    steps:
+        - db-tier:
+            action: .compute.grow
+            parameters:
+                roleName: db-node
+                os: "{$.os}"
+                vmIdentity: "{$.identity}"
+            output:
+                 db-hosts: privateips
+
+        - app-tier:
+            action: .compute.grow
+            parameters:
+                roleName: app-node
+                quantity: "{$.app-tier-size}"
+                os: "{$.os}"
+                vmIdentity: "{$.identity}"
+            output:
+                app-hosts: ips
+
+        - lb-tier:
+            action: .compute.grow
+            parameters:
+                roleName: lb-node
+                os: "{$.os}"
+                vmIdentity: "{$.identity}"
+            output:
+                lb-hosts: ips
+
+        - database:
+            action: .deploy.db
+            precedingPhases: [ provision ]
+            phase: deploy-db
+            parameters:
+              app-fork: "{$.app-fork}"
+              app-branch: "{$.app-branch}"
+
+        - lb-install:
+            action: "chefrun"
+            precedingPhases: [ provision ]
+            phase: install-lb
+            parameters:
+              roles: [ lb-node ]
+              runList: ["recipe[haproxy]"]
+              isSolo: true
+              recipeUrl: "https://raw.github.com/qubell/starter-java-web/qubell/cookbooks.tar.gz"
+
+        - app:
+            action: .install.app
+            precedingPhases: [ provision ]
+            phase: deploy-app
+            parameters:
+              db-hosts: "{$.db-hosts}"
+              app-hosts: "{$.app-hosts}"
+              app-fork: "{$.app-fork}"
+              app-branch: "{$.app-branch}"
+
+    return:
+        db-hosts:
+            description: Database IP address
+            value: "{$.db-hosts}"
+        app-hosts:
+            description: Application IP address
+            value: "{$.app-hosts}"
+        lb-hosts:
+            description: Load Balancer IP address
+            value: "{$.lb-hosts}"
+        app-url:
+            description: Url to the application
+            value: "http://{$.lb-tier~hosts[0]}"
+        haproxy-url:
+            description: Url to haproxy stats
+            value: "http://{$.lb-tier~hosts[0]}:22002/"
+
+scale-up:
+    parameters:
+        - app-count:
+            description: Additional servers in app tier
+            default: 1
+            min: 1
+            max: 20
+        - app-fork: *app-fork
+        - app-branch: *app-branch
+        - os: *os
+        - identity: *identity
+
+    steps:
+        - app-tier:
+            action: .compute.grow
+            parameters:
+                roleName: app-node
+                quantity: "{$.app-count}"
+                os: "{$.os}"
+                vmIdentity: "{$.identity}"
+            output:
+                app-hosts: ips
+
+        - app:
+            action: .install.app
+            precedingPhases: [ provision ]
+            phase: deploy-app
+            parameters:
+              db-hosts: "{$.db-hosts}"
+              app-hosts: "{$.app-hosts}"
+              app-fork: "{$.app-fork}"
+              app-branch: "{$.app-branch}"
+
+    return:
+        app-hosts:
+            description: Application IP address
+            value: "{$.app-hosts}"
+
+scale-down:
+    parameters:
+        - app-count:
+            description: Number of app tier servers to remove
+            default: 1
+            min: 1
+            max: 20
+    steps:
+        - shrink-app-tier:
+            action: "destroyVms"
+            parameters:
+              phase: "destroy"
+              roleName: app-node
+              quantity: "{$.app-count}"
+            output:
+              app-hosts: ips
+
+        - setup-lb:
+            action: .setup.lb
+            precedingPhases: [ destroy ]
+            phase: setup-lb
+            parameters:
+               app-hosts: "{$.app-hosts}"
+
+    return:
+        app-hosts:
+            description: Application IP address
+            value: "{$.app-hosts}"
+
+
+update:
+    parameters:
+        - app-fork: *app-fork
+        - app-branch: *app-branch
+
+    steps:
+        - update-app:
+            action: .deploy.app
+            parameters:
+              db-hosts: "{$.db-hosts}"
+              app-fork: "{$.app-fork}"
+              app-branch: "{$.app-branch}"
+
+destroy:
+    steps:
+        - destroy:
+            action: compute.shrink-all
+
+
+.compute.grow:
+  parameters:
+    - phase:
+        default: provision
+    - roleName:
+        default: defaultRole
+    - quantity:
+        default: 1
+    - identity:
+        default: undefined
+    - credential:
+        default: undefined
+    - os:
+        default: undefined
+    - vmIdentity:
+        default: undefined
+  steps:
+    provision-vms:
+      action: "provisionVms"
+      parameters:
+         phase: "{$.phase}"
+         roleName: "{$.roleName}"
+         hardwareId: m1.small
+         quantity: "{$.quantity}"
+         retryCount: 1
+         jcloudsProvider: aws-ec2
+         jcloudsEndpoint: https://ec2.us-east-1.amazonaws.com
+         jcloudsRegions: us-east-1
+         jcloudsNodeNamePrefix: petclinic
+         jcloudsIdentity: "{$.identity}"
+         jcloudsCredential: "{$.credential}"
+         vmIdentity: "{$.vmIdentity}"
+         imageId: "{$.os}"
+         ec2SecurityGroup: default
+      output:
+         hosts: ips
+         privateips: privateips
+  return:
+    ips:
+      value: "{$.hosts}"
+    privateips:
+      value: "{$.privateips}"
+
+.deploy.db:
+  parameters:
+    - app-fork: *app-fork
+    - app-branch: *app-branch
+  steps:
+    - install-database:
+        action: "chefrun"
+        phase: install-db
+        parameters:
+          roles: [ db-node ]
+          runList: ["recipe[mysql::server]"]
+          isSolo: true
+          recipeUrl: "https://raw.github.com/qubell/starter-java-web/qubell/cookbooks.tar.gz"
+          jattrs:
+              mysql:
+                server_root_password: e653e94ee8d064ec95ef5a1381c87a23
+                server_repl_password: e653e94ee8d064ec95ef5a1381c87a23
+                server_debian_password: e653e94ee8d064ec95ef5a1381c87a23
+
+    - deploy-database:
+        action: "chefrun"
+        phase: deploy-db
+        precedingPhases: [ install-db ]
+        parameters:
+          roles: [ db-node ]
+          runList: ["recipe[qubell::mysql]"]
+          isSolo: true
+          recipeUrl: "https://raw.github.com/qubell/starter-java-web/qubell/cookbooks.tar.gz"
+          jattrs:
+              database:
+                name: "petclinic"
+                user: "petclinic"
+                password: "petclinic"
+                schema: "https://raw.github.com/{$.app-fork}/starter-java-web/{$.app-branch}/src/main/resources/db/mysql/petclinic-mysql-schema.sql"
+                data:   "https://raw.github.com/{$.app-fork}/starter-java-web/{$.app-branch}/src/main/resources/db/mysql/petclinic-mysql-dataload.sql"
+
+.deploy.app:
+  parameters:
+    - db-hosts:
+        description: Database IP address
+    - app-fork: *app-fork
+    - app-branch: *app-branch
+  steps:
+    - deploy-app:
+        action: "chefrun"
+        phase: deploy-app
+        parameters:
+          roles: [ app-node ]
+          runList: ["recipe[qubell::webapp]"]
+          isSolo: true
+          recipeUrl: "https://raw.github.com/qubell/starter-java-web/qubell/cookbooks.tar.gz"
+          jattrs:
+            scm:
+              provider: "git"
+              repository: git://github.com/{$.app-fork}/starter-java-web.git
+              revision: "{$.app-branch}"
+            database:
+              name: "petclinic"
+              host: "{$.db-hosts}"
+              user: "petclinic"
+              password: "petclinic"
+
+.setup.lb:
+  parameters:
+    - app-hosts:
+        description: Application IP address
+  steps:
+    - setup-lb:
+        action: "chefrun"
+        parameters:
+          roles: [ lb-node ]
+          runList: ["recipe[qubell::lb]"]
+          isSolo: true
+          recipeUrl: "https://raw.github.com/qubell/starter-java-web/qubell/cookbooks.tar.gz"
+          jattrs:
+            haproxy.rebalance:
+              nodes: "{$.app-hosts}"
+
+.install.app:
+  parameters:
+    - db-hosts:
+        description: Database IP address
+    - app-hosts:
+        description: Application IP address
+    - app-fork: *app-fork
+    - app-branch: *app-branch
+  steps:
+    - install-app:
+        action: "chefrun"
+        phase: install-app
+        parameters:
+          roles: [ app-node ]
+          runList: ["recipe[tomcat]"]
+          isSolo: true
+          recipeUrl: "https://raw.github.com/qubell/starter-java-web/qubell/cookbooks.tar.gz"
+
+    - deploy:
+        action: .deploy.app
+        phase: deploy-app
+        precedingPhases: [ install-app ]
+        parameters:
+          db-hosts: "{$.db-hosts}"
+          app-fork: "{$.app-fork}"
+          app-branch: "{$.app-branch}"
+
+    - setup-lb:
+        action: .setup.lb
+        precedingPhases: [ deploy-app ]
+        phase: setup-lb
+        parameters:
+          app-hosts: "{$.app-hosts}"
